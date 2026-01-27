@@ -1,0 +1,16 @@
+# 1. Python Virtual Environment (The big 110MB+ folders)
+bin/
+include/
+lib/
+pyvenv.cfg
+.langgraph_api/
+
+# 2. Sensitive Credentials
+.env
+
+# 3. Python Cache (The __pycache__ folders in your screenshot)
+__pycache__/
+**/*.pyc
+
+# 4. Large Data Files (PDFs should usually be handled separately)
+data/*.pdf
