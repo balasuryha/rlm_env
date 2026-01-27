@@ -1,0 +1,29 @@
+[project]
+name = "bank-rlm-agent"
+version = "0.1.0"
+description = "Recursive Language Model Banking Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+# 2026 Core Dependencies
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain-openai>=0.3.0",
+    "langchain-google-genai>=2.0.0",
+    "pydantic>=2.10.0",
+    "RestrictedPython>=7.0",
+    "pymupdf4llm>=0.0.17",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "python-dotenv>=1.0.1"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
