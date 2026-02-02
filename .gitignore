@@ -7,6 +7,7 @@ pyvenv.cfg
 
 # 2. Sensitive Credentials
 .env
+.DS_Store
 
 # 3. Python Cache (The __pycache__ folders in your screenshot)
 __pycache__/
