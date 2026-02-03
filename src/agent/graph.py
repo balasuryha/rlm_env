@@ -1,114 +1,161 @@
 import os
-from typing import Annotated, TypedDict, List
-from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import ToolNode, tools_condition
+import httpx
+import re
+from typing import List
+from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+
+# ✅ IMPORT STATE FROM state.py
+from .state import RLMState
+
+# Import your tool
 from .tools import recursive_document_search
 
-# A simple reducer to append new history items
-def update_history(left: List[str], right: List[str]) -> List[str]:
-    return left + right
-
-class RLMState(TypedDict):
-    messages: Annotated[list, add_messages]
-    # Tracks the code/offsets tried: e.g., ["Offset 500: ToC", "Offset 1200: Sidebar"]
-    search_history: Annotated[List[str], update_history]
-
-# Updated for GPT-OSS 120B specific parameters
-llm = ChatOpenAI(
-    model="openai/gpt-oss-120b", 
-    openai_api_key=os.getenv("OPENROUTER_API_KEY"), # Use OpenRouter Key
-    base_url="https://openrouter.ai/api/v1",
-    temperature=1.0, # GPT-OSS performs better at temp 1.0 with reasoning enabled
-    model_kwargs={
-        "extra_body": {
-            "reasoning_effort": "high" # Ensures deep logic for regex/slicing
-        }
-    },
-    default_headers={
-        "HTTP-Referer": "http://localhost:2024", 
-        "X-Title": "LangGraph Agent",
-    }
-)
-
-# Tool binding remains the same
-tools = [recursive_document_search]
-llm_with_tools = llm.bind_tools(tools)
-
-def call_model(state: RLMState):
-    current_depth = state.get("depth", 0)
-    
-    system_msg = {
-        "role": "system", 
-        "content": (
-            f"You are on attempt {current_depth + 1} of {MAX_RECURSION_DEPTH}.\n"
-            "After extracting data, evaluate your confidence (0.0-1.0).\n"
-            "If the data is missing or ambiguous, keep confidence LOW.\n"
-            "You must return your response in JSON format if not calling a tool:\n"
-            "{'answer': '...', 'confidence': 0.9}"
-            "You are a document extractor. IMPORTANT: The document contains a Table of Contents (ToC).\n"
-            "If your search returns a list of page numbers, you are in the ToC. \n"
-            "You must look deeper in the document (higher character offsets) to find the actual content.\n"
-            "Always assign your final string to the variable 'result'."
-        )
-    }
-    
-    messages = [system_msg] + state["messages"]
-    response = llm_with_tools.invoke(messages)
-    
-    # Logic to parse confidence from the AI's prose if it's not a tool call
-    conf_value = 0.0
-    if not response.tool_calls:
-        # Simple extraction logic (or use structured output)
-        if "confidence" in response.content:
-            # (Logic to extract float from text)
-            conf_value = 0.85 
-
-    return {
-        "messages": [response],
-        "depth": current_depth + 1,
-        "confidence": conf_value
-    }
-
+# --- 1. CONFIGURATION ---
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_RECURSION_DEPTH = 5
 CONFIDENCE_THRESHOLD = 0.8
 
+# --- 2. THE AGENT NODE ---
+async def call_model(state: RLMState):
+    current_depth = state.get("depth", 0)
+
+    system_content = (
+    f"You are on attempt {current_depth + 1} of {MAX_RECURSION_DEPTH}.\n"
+    "A document is ALREADY LOADED as a STRING (markdown text) in `doc`.\n"
+    "Use ONLY regex or string operations to search it.\n\n"
+    "TOOL RULES (MANDATORY):\n"
+    "1. Tool code MUST assign its output to a variable named `result`.\n"
+    "2. Tool code MUST NOT return JSON.\n"
+    "3. Tool code MUST NOT print.\n"
+    "4. The agent (not the tool) produces the final JSON answer.\n\n"
+    "IMPORT RULES (STRICT):\n"
+    "5. You MAY ONLY use: `import re` OR `import json`\n"
+    "6. You MUST NOT import any other module.\n"
+    "7. Do NOT use textwrap, sys, math, pathlib, or any other libraries.\n"
+    "8. If you import anything else, execution will fail.\n\n"
+    "EXECUTION RULES:\n"
+    "9. You MUST call the tool at least once before answering.\n"
+    "10. If you answer without calling the tool, the response is invalid.\n\n"
+    "Final agent response format:\n"
+    "{ \"answer\": \"...\", \"confidence\": 0.0-1.0 }\n"
+)
+
+
+    # --- STRICT ROLE MAPPING ---
+    formatted_messages = [{"role": "system", "content": system_content}]
+
+    for msg in state["messages"]:
+        if isinstance(msg, dict):
+            role = msg.get("role", "assistant")
+            content = msg.get("content", "")
+        else:
+            role = getattr(msg, "type", "assistant")
+            content = getattr(msg, "content", "")
+
+        role = "user" if role in ("human", "user") else "assistant"
+        formatted_messages.append({"role": role, "content": content})
+
+    payload = {
+        "model": "openai/gpt-oss-120b",
+        "messages": formatted_messages,
+        "temperature": 1.0,
+        "extra_body": {"reasoning_effort": "high"},
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "recursive_document_search",
+                "description": "Run restricted Python on the document. Assign output to `result`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string"}
+                    },
+                    "required": ["code"]
+                }
+            }
+        }]
+    }
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "HTTP-Referer": "http://localhost:2024",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient(verify=False) as client:
+        response = await client.post(
+            OPENROUTER_URL, headers=headers, json=payload, timeout=60.0
+        )
+
+    if response.status_code != 200:
+        return {
+            "messages": [{"role": "assistant", "content": response.text}],
+            "search_history": [f"Depth {current_depth}: API error"],
+            "confidence": 0.0,
+            "depth": current_depth + 1
+        }
+
+    data = response.json()
+    message = data["choices"][0]["message"]
+    content = message.get("content", "") or ""
+
+    confidence = 0.0
+    match = re.search(r'"confidence"\s*:\s*(1(?:\.0+)?|0(?:\.\d+)?)', content)
+    if match:
+        confidence = float(match.group(1))
+
+    history = (
+        ["Tool invoked"]
+        if message.get("tool_calls")
+        else [f"Answered with confidence {confidence}"]
+    )
+
+    return {
+        "messages": state["messages"] + [message],
+        "depth": current_depth + 1,
+        "confidence": confidence,
+        "search_history": history
+    }
+
+
+# --- 3. ROUTING LOGIC ---
 def should_continue(state: RLMState):
-    # 1. Check if we've hit the recursion limit (Safety Valve)
-    if state.get("depth", 0) >= MAX_RECURSION_DEPTH:
-        return "exit"
-    
-    # 2. Check if the AI has expressed high confidence in its current answer
-    if state.get("confidence", 0.0) >= CONFIDENCE_THRESHOLD:
-        return "exit"
-    
-    # 3. Inspect the last message
-    last_message = state["messages"][-1]
-    
-    # 4. If the AI wants to use the search tool, go to 'tools'
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+    # Always allow tool on first pass
+    if state["depth"] == 1:
         return "tools"
-    
-    # 5. If no tool calls and no high confidence, but it provided an answer, 
-    # we exit (or you could force a retry if you want to be stricter).
-    return "exit"
+
+    if state["depth"] >= MAX_RECURSION_DEPTH:
+        return "exit"
+
+    if state["confidence"] >= CONFIDENCE_THRESHOLD:
+        return "exit"
+
+    last = state["messages"][-1]
+    tool_calls = last.get("tool_calls") if isinstance(last, dict) else None
+
+    return "tools" if tool_calls else "exit"
 
 
-# Graph construction remains correct
+
+# --- 4. GRAPH CONSTRUCTION ---
 builder = StateGraph(RLMState)
+
 builder.add_node("agent", call_model)
-builder.add_node("tools", ToolNode(tools))
+builder.add_node("tools", ToolNode([recursive_document_search]))
+
 builder.add_edge(START, "agent")
-builder.add_conditional_edges("agent", tools_condition)
-builder.add_edge("tools", "agent")
+
 builder.add_conditional_edges(
-    "agent", 
-    should_continue, 
+    "agent",
+    should_continue,
     {
-        "tools": "tools", 
+        "tools": "tools",
         "exit": END
     }
 )
+
+builder.add_edge("tools", "agent")
+
 
 graph = builder.compile()

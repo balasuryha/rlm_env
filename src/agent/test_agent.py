@@ -14,7 +14,7 @@ async def run_test():
         "messages": [
             {
                 "role": "user", 
-                "content": "Find the Risk Management Framework section... extract the Current Risk Situation."
+                "content": "Find the Risk Management Framework section... extract the Current Risk Situation. Perform the import functions with what you already have acces to"
             }
         ],
         "depth": 0,

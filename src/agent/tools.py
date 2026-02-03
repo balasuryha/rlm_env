@@ -1,56 +1,74 @@
 import re
-import logging # Added for cleaner terminal output
+import json
+import logging
 from RestrictedPython import compile_restricted, safe_globals
+from RestrictedPython.PrintCollector import PrintCollector
 from RestrictedPython.Eval import default_guarded_getitem, default_guarded_getiter
-from RestrictedPython.Guards import guarded_iter_unpack_sequence
+from RestrictedPython.Guards import guarded_iter_unpack_sequence, full_write_guard
 import pymupdf4llm
 from langchain_core.tools import tool
 
-# Setup logging to see the AI's code in your console
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ToolDebugger")
 
-# Pre-load content
-MANUAL_CONTENT = pymupdf4llm.to_markdown("data/six-annual-report-2024-en.pdf")
+# Pre-load document content
+try:
+    MANUAL_CONTENT = pymupdf4llm.to_markdown("data/six-annual-report-2024-en.pdf")
+except Exception as e:
+    MANUAL_CONTENT = "Error loading PDF: " + str(e)
 
-def _safe_import(name, *args, **kwargs):
-    if name == 're': return re
-    raise ImportError(f"Import of {name} is forbidden.")
+# Safe import handler
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """
+    Allow only 're' and 'json' to be imported inside sandbox.
+    """
+    if name in ("re", "json"):
+        return __import__(name, globals, locals, fromlist, level)
+    raise ImportError(f"Module '{name}' is restricted in sandbox.")
 
 @tool
 def recursive_document_search(code: str):
-    """Safely execute Python code on MANUAL_CONTENT. 're' is pre-loaded."""
-    
-    # 1. CLEANING: Remove AI artifacts like ```python or leading spaces
-    clean_code = code.replace("```python", "").replace("```", "").strip()
-    
-    # 2. LOGGING: Print the code so you can see it in your terminal
-    print("\n" + "="*30)
-    print("AI EXECUTING CODE:")
-    print(clean_code)
-    print("="*30 + "\n")
+    """
+    Safely execute Python code in sandbox. 
+    Available variables:
+        - doc: preloaded document as string (markdown)
+        - MANUAL_CONTENT: same as doc
+        - result: must assign output here
+    Only allowed imports: re, json
+    """
+    # Clean AI markdown code blocks if present
+    clean_code = re.sub(r'^```python\n|```$', '', code, flags=re.MULTILINE).strip()
 
+    logger.info("Executing sandbox code:\n%s", clean_code)
+
+    # Safe environment
     safe_env = safe_globals.copy()
     safe_env.update({
+        "doc": MANUAL_CONTENT,
+        "document": MANUAL_CONTENT,
         "MANUAL_CONTENT": MANUAL_CONTENT,
         "re": re,
+        "json": json,
+        "result": None,
+
+        # Guards for RestrictedPython
         "__import__": _safe_import,
-        "result": None, # Default to None to detect missing assignments
-        "_getitem_": default_guarded_getitem,      
-        "_getiter_": default_guarded_getiter,      
+        "_getattr_": getattr,
+        "_write_": full_write_guard,
+        "_getitem_": default_guarded_getitem,
+        "_getiter_": default_guarded_getiter,
         "_iter_unpack_sequence_": guarded_iter_unpack_sequence,
-        "len": len
+        "_print_": PrintCollector,
+
+        # basic built-ins
+        "len": len, "str": str, "int": int, "list": list, "dict": dict
     })
-    
+
     try:
         byte_code = compile_restricted(clean_code, filename='<inline>', mode='exec')
         exec(byte_code, safe_env)
-        
-        # Check if the AI actually assigned a value
         final_result = safe_env.get('result')
-        if final_result is None:
-            return "Execution Success, but you forgot to assign the answer to the 'result' variable."
-        return str(final_result)
-        
+        return str(final_result) if final_result is not None else "Success, but 'result' not set."
     except Exception as e:
         return f"Execution Error: {str(e)}"
