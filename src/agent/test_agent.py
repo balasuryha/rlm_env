@@ -13,7 +13,7 @@ async def run_test():
         "messages": [
             {
                 "role": "user", 
-                "content": "Find the Risk Management Framework section"
+                "content": "Find the financial review section"
             }
         ],
         "depth": 0,
