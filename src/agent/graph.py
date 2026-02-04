@@ -1,161 +1,132 @@
 import os
 import httpx
 import re
-from typing import List
-from langgraph.prebuilt import ToolNode
+import json
+import logging
 from langgraph.graph import StateGraph, START, END
-
-# ✅ IMPORT STATE FROM state.py
 from .state import RLMState
-
-# Import your tool
 from .tools import recursive_document_search
 
-# --- 1. CONFIGURATION ---
+# --- CONFIG ---
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MAX_RECURSION_DEPTH = 5
+MAX_RECURSION_DEPTH = 3
 CONFIDENCE_THRESHOLD = 0.8
+MODEL = "openai/gpt-oss-120b"
+TIMEOUT = 60.0
 
-# --- 2. THE AGENT NODE ---
+logger = logging.getLogger("ToolDebugger")
+
+def serialize_message(msg):
+    if isinstance(msg, dict):
+        return {"role": msg.get("role", "assistant"), "content": str(msg.get("content", ""))}
+    if hasattr(msg, "content"):
+        role = "user" if getattr(msg, "type", "") == "human" else "assistant"
+        return {"role": role, "content": str(msg.content)}
+    return {"role": "assistant", "content": str(msg)}
+
+# --- AGENT NODE ---
+
 async def call_model(state: RLMState):
     current_depth = state.get("depth", 0)
-
-    system_content = (
-    f"You are on attempt {current_depth + 1} of {MAX_RECURSION_DEPTH}.\n"
-    "A document is ALREADY LOADED as a STRING (markdown text) in `doc`.\n"
-    "Use ONLY regex or string operations to search it.\n\n"
-    "TOOL RULES (MANDATORY):\n"
-    "1. Tool code MUST assign its output to a variable named `result`.\n"
-    "2. Tool code MUST NOT return JSON.\n"
-    "3. Tool code MUST NOT print.\n"
-    "4. The agent (not the tool) produces the final JSON answer.\n\n"
-    "IMPORT RULES (STRICT):\n"
-    "5. You MAY ONLY use: `import re` OR `import json`\n"
-    "6. You MUST NOT import any other module.\n"
-    "7. Do NOT use textwrap, sys, math, pathlib, or any other libraries.\n"
-    "8. If you import anything else, execution will fail.\n\n"
-    "EXECUTION RULES:\n"
-    "9. You MUST call the tool at least once before answering.\n"
-    "10. If you answer without calling the tool, the response is invalid.\n\n"
-    "Final agent response format:\n"
-    "{ \"answer\": \"...\", \"confidence\": 0.0-1.0 }\n"
-)
-
-
-    # --- STRICT ROLE MAPPING ---
-    formatted_messages = [{"role": "system", "content": system_content}]
-
-    for msg in state["messages"]:
-        if isinstance(msg, dict):
-            role = msg.get("role", "assistant")
-            content = msg.get("content", "")
-        else:
-            role = getattr(msg, "type", "assistant")
-            content = getattr(msg, "content", "")
-
-        role = "user" if role in ("human", "user") else "assistant"
-        formatted_messages.append({"role": role, "content": content})
-
-    payload = {
-        "model": "openai/gpt-oss-120b",
-        "messages": formatted_messages,
-        "temperature": 1.0,
-        "extra_body": {"reasoning_effort": "high"},
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "recursive_document_search",
-                "description": "Run restricted Python on the document. Assign output to `result`.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string"}
-                    },
-                    "required": ["code"]
-                }
-            }
-        }]
-    }
-
+    user_query = state["messages"][0].content if state["messages"] else "Extract requested information."
+    
     headers = {
         "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-        "HTTP-Referer": "http://localhost:2024",
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient(verify=False) as client:
-        response = await client.post(
-            OPENROUTER_URL, headers=headers, json=payload, timeout=60.0
-        )
+    # 1️⃣ PHASE ONE: ADAPTIVE CODE GENERATION
+    # No hardcoding. The model is told to be "greedy" to capture full context.
+    code_prompt = f"""You are a Python extraction agent. (Attempt {current_depth + 1})
+Document string: `doc`. Modules: `re`, `json`.
 
-    if response.status_code != 200:
-        return {
-            "messages": [{"role": "assistant", "content": response.text}],
-            "search_history": [f"Depth {current_depth}: API error"],
-            "confidence": 0.0,
-            "depth": current_depth + 1
-        }
+TASK: Satisfy the user request: "{user_query}"
 
-    data = response.json()
-    message = data["choices"][0]["message"]
-    content = message.get("content", "") or ""
+STRATEGY:
+1. Use `re.finditer` or `re.search` to find the most relevant header or keywords.
+2. Since PDFs converted to Markdown can have messy headers (e.g., "# 1.2 Risk Management"), use flexible regex like `r'#+.*Risk.*Management.*'`.
+3. Capture a large block of text (e.g., 2000-4000 characters) following the match to ensure you don't cut off the content.
+4. If a specific section is not found, return the first 20 lines of the document so we can see the format.
 
-    confidence = 0.0
-    match = re.search(r'"confidence"\s*:\s*(1(?:\.0+)?|0(?:\.\d+)?)', content)
-    if match:
-        confidence = float(match.group(1))
+RULES:
+- NO 'import' statements.
+- The modules re and json are already available. Do not use the import keyword.
+- Assign the final text to the variable `result`.
+- Return ONLY valid JSON: {{"python_code": "..."}}
+"""
 
-    history = (
-        ["Tool invoked"]
-        if message.get("tool_calls")
-        else [f"Answered with confidence {confidence}"]
-    )
+    msgs = [{"role": "system", "content": code_prompt}] + [serialize_message(m) for m in state["messages"]]
 
+    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
+        try:
+            # 1. Generate Python snippet
+            res_code = await client.post(OPENROUTER_URL, headers=headers, json={
+                "model": MODEL, "messages": msgs, "temperature": 0.0
+            })
+            res_code.raise_for_status()
+            
+            raw_code_resp = res_code.json()["choices"][0]["message"]["content"]
+            json_match = re.search(r'\{.*\}', raw_code_resp, re.S).group()
+            code = json.loads(json_match)["python_code"]
+            
+            # 2. Run in Tool
+            tool_output = recursive_document_search.invoke({"code": code})
+            logger.info(f"Tool Output Sample: {str(tool_output)[:100]}...")
+            
+        except Exception as e:
+            tool_output = f"Critical extraction error: {str(e)}"
+
+        # 2️⃣ PHASE TWO: INTELLIGENT SYNTHESIS
+        synth_prompt = f"""
+        Original User Query: {user_query}
+        Data Extracted from Doc: {tool_output}
+        
+        Instruction: 
+        Analyze the data. If it looks like a list of headers or random text, state that you couldn't find the specific answer.
+        Otherwise, answer the query based ONLY on the extracted text.
+        Return JSON: {{"answer": "...", "confidence": 0.0-1.0}}
+        """
+        
+        res_synth = await client.post(OPENROUTER_URL, headers=headers, json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": "Return ONLY JSON with 'answer' and 'confidence'."},
+                {"role": "user", "content": synth_prompt}
+            ],
+            "temperature": 0.0
+        })
+        
+        try:
+            synth_json = re.search(r'\{.*\}', res_synth.json()["choices"][0]["message"]["content"], re.S).group()
+            final_data = json.loads(synth_json)
+            answer = final_data.get("answer", "Parsing error in synthesis.")
+            conf = float(final_data.get("confidence", 0.0))
+            final_message = f"{answer}\n\n---\n**Confidence Score:** {int(conf * 100)}%"
+        except:
+            answer = "The system failed to interpret the document results."
+            conf = 0.0
+
+    # 3️⃣ UPDATE STATE
+    # Note: Jan 27 Update - appending to search_history list.
     return {
-        "messages": state["messages"] + [message],
+        "messages": [{"role": "assistant", "content": answer}],
         "depth": current_depth + 1,
-        "confidence": confidence,
-        "search_history": history
+        "confidence": conf,
+        "search_history": [f"Depth {current_depth+1}: Query '{user_query[:15]}', Output Len {len(str(tool_output))}, , Confidence: {conf:.2f}"]
     }
 
+# --- ROUTER ---
 
-# --- 3. ROUTING LOGIC ---
-def should_continue(state: RLMState):
-    # Always allow tool on first pass
-    if state["depth"] == 1:
-        return "tools"
+def route_decision(state: RLMState):
+    if state["confidence"] >= CONFIDENCE_THRESHOLD or state["depth"] >= MAX_RECURSION_DEPTH:
+        return "end"
+    return "continue"
 
-    if state["depth"] >= MAX_RECURSION_DEPTH:
-        return "exit"
+# --- GRAPH ---
 
-    if state["confidence"] >= CONFIDENCE_THRESHOLD:
-        return "exit"
-
-    last = state["messages"][-1]
-    tool_calls = last.get("tool_calls") if isinstance(last, dict) else None
-
-    return "tools" if tool_calls else "exit"
-
-
-
-# --- 4. GRAPH CONSTRUCTION ---
 builder = StateGraph(RLMState)
-
 builder.add_node("agent", call_model)
-builder.add_node("tools", ToolNode([recursive_document_search]))
-
 builder.add_edge(START, "agent")
-
-builder.add_conditional_edges(
-    "agent",
-    should_continue,
-    {
-        "tools": "tools",
-        "exit": END
-    }
-)
-
-builder.add_edge("tools", "agent")
-
+builder.add_conditional_edges("agent", route_decision, {"continue": "agent", "end": END})
 
 graph = builder.compile()

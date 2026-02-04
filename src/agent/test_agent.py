@@ -14,7 +14,7 @@ async def run_test():
         "messages": [
             {
                 "role": "user", 
-                "content": "Find the Risk Management Framework section... extract the Current Risk Situation. Perform the import functions with what you already have acces to"
+                "content": "Find the Risk Management Framework section"
             }
         ],
         "depth": 0,
@@ -44,7 +44,7 @@ async def run_test():
                 content = getattr(last_msg, "content", "")
 
             print(f"\n[Node Event]: {event.event}")
-            print(f"[Content]: {content[:200]}...") # Truncated for readability
+            print(f"[Content]: {content}...") # Truncated for readability
             print(f"[History Count]: {len(history)}")
         else:
             # This handles the metadata/start events silently
