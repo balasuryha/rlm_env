@@ -29,8 +29,6 @@ def recursive_document_search(code: str):
     clean_code = re.sub(r'^```python\n|```$', '', code, flags=re.MULTILINE).strip()
 
     # 2. SANITIZATION: Strip 'import' and 'from' keywords.
-    # This prevents RestrictedPython from throwing "__import__ not found" errors.
-    # Since we inject 're' and 'json' below, the code will still work.
     clean_code = re.sub(r'^(import|from)\s+.*$', '', clean_code, flags=re.MULTILINE).strip()
 
     logger.info("Executing Sanitized Sandbox Code:\n%s", clean_code)
@@ -41,7 +39,7 @@ def recursive_document_search(code: str):
         # Data
         "doc": MANUAL_CONTENT,
         
-        # Pre-injected modules (LLM can use 're.search' directly)
+        # Pre-injected modules
         "re": re,
         "json": json,
         
@@ -60,25 +58,49 @@ def recursive_document_search(code: str):
         "len": len, 
         "str": str, 
         "int": int, 
+        "float": float,
         "list": list, 
         "dict": dict,
+        "tuple": tuple,
+        "set": set,
         "range": range,
-        "bool": bool
+        "bool": bool,
+        "enumerate": enumerate,  # ← ADD THIS
+        "zip": zip,              # ← ADD THIS
+        "map": map,              # ← ADD THIS
+        "filter": filter,        # ← ADD THIS
+        "sorted": sorted,        # ← ADD THIS
+        "min": min,              # ← ADD THIS
+        "max": max,              # ← ADD THIS
+        "sum": sum,              # ← ADD THIS
+        "abs": abs,              # ← ADD THIS
+        "round": round,          # ← ADD THIS
+        "any": any,              # ← ADD THIS
+        "all": all,              # ← ADD THIS
     })
 
     try:
-        # 4. Compile and Execute
         byte_code = compile_restricted(clean_code, filename='<inline>', mode='exec')
         exec(byte_code, safe_env)
         
-        # 5. Extract the result
         final_result = safe_env.get('result')
         
         if final_result is None:
             return "Sandbox executed, but the variable 'result' was not assigned any value."
+        
+        result_str = str(final_result)
+        
+        # Return message about empty results for LLM to handle
+        if len(result_str.strip()) == 0:
+            return "Search completed but found no matches. The pattern did not match any content in the document."
+        
+        MAX_RESULT_LENGTH = 2000
+        
+        if len(result_str) > MAX_RESULT_LENGTH:
+            logger.warning(f"Tool result truncated from {len(result_str)} to {MAX_RESULT_LENGTH} chars")
+            return result_str[:MAX_RESULT_LENGTH] + "\n\n[...truncated]"
             
-        return str(final_result)
+        return result_str
 
     except Exception as e:
-        # If the LLM still tried to do something forbidden, we catch it here
         return f"Sandbox Security/Execution Error: {str(e)}"

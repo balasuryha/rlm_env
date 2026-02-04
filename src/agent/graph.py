@@ -4,129 +4,212 @@ import re
 import json
 import logging
 from langgraph.graph import StateGraph, START, END
+
+# ✅ IMPORT STATE FROM state.py
 from .state import RLMState
+
+# Import your tool
 from .tools import recursive_document_search
 
-# --- CONFIG ---
+# --- 1. CONFIGURATION ---
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MAX_RECURSION_DEPTH = 3
+MAX_RECURSION_DEPTH = 5
 CONFIDENCE_THRESHOLD = 0.8
-MODEL = "openai/gpt-oss-120b"
-TIMEOUT = 60.0
+MODEL = "openai/gpt-oss-120b"  # Changed to a more reliable model
 
 logger = logging.getLogger("ToolDebugger")
-
-def serialize_message(msg):
-    if isinstance(msg, dict):
-        return {"role": msg.get("role", "assistant"), "content": str(msg.get("content", ""))}
-    if hasattr(msg, "content"):
-        role = "user" if getattr(msg, "type", "") == "human" else "assistant"
-        return {"role": role, "content": str(msg.content)}
-    return {"role": "assistant", "content": str(msg)}
-
-# --- AGENT NODE ---
+logger.setLevel(logging.INFO)
 
 async def call_model(state: RLMState):
     current_depth = state.get("depth", 0)
-    user_query = state["messages"][0].content if state["messages"] else "Extract requested information."
     
+    system_content = (
+        f"Attempt {current_depth + 1}/{MAX_RECURSION_DEPTH}. "
+        "Document loaded as `doc` (markdown).\n\n"
+        "TOOL: recursive_document_search - assigns to `result`. "
+        "Only: `import re` or `import json`.\n\n"
+        "If tool returns no matches, refine your search pattern and try again.\n"
+        "After getting useful tool results, respond with:\n"
+        '{"answer": "...", "confidence": 0.0-1.0}\n'
+        "No markdown blocks, just JSON."
+    )
+
+    # LIMIT HISTORY TO LAST 5 MESSAGES
+    formatted_messages = [{"role": "system", "content": system_content}]
+    recent_messages = state["messages"][-5:] if len(state["messages"]) > 5 else state["messages"]
+    
+    MAX_MESSAGE_LENGTH = 3000
+    for msg in recent_messages:
+        if isinstance(msg, dict):
+            role = msg.get("role", "assistant")
+            content = msg.get("content", "")
+        else:
+            role = "user" if getattr(msg, "type", "") == "human" else "assistant"
+            content = getattr(msg, "content", "")
+        
+        # Truncate long messages
+        if len(content) > MAX_MESSAGE_LENGTH:
+            content = content[:MAX_MESSAGE_LENGTH] + "\n[...truncated]"
+        
+        formatted_messages.append({"role": role, "content": content})
+
+    logger.info(f"=== DEPTH {current_depth + 1} === Sending {len(formatted_messages)} messages")
+
+    # PAYLOAD
+    payload = {
+        "model": MODEL,
+        "messages": formatted_messages,
+        "temperature": 0.7,
+        "max_tokens": 1000,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "recursive_document_search",
+                "description": "Run Python on doc. Assign to `result`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string"}
+                    },
+                    "required": ["code"]
+                }
+            }
+        }]
+    }
+
     headers = {
         "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "HTTP-Referer": "http://localhost:2024",
         "Content-Type": "application/json"
     }
 
-    # 1️⃣ PHASE ONE: ADAPTIVE CODE GENERATION
-    # No hardcoding. The model is told to be "greedy" to capture full context.
-    code_prompt = f"""You are a Python extraction agent. (Attempt {current_depth + 1})
-Document string: `doc`. Modules: `re`, `json`.
+    async with httpx.AsyncClient(verify=False) as client:
+        response = await client.post(
+            OPENROUTER_URL, headers=headers, json=payload, timeout=60.0
+        )
 
-TASK: Satisfy the user request: "{user_query}"
+    if response.status_code != 200:
+        logger.error(f"API Error: {response.status_code} - {response.text}")
+        return {
+            "messages": [{"role": "assistant", "content": f"API Error: {response.text}"}],
+            "depth": current_depth + 1,
+            "confidence": 0.0,
+            "search_history": [f"Depth {current_depth+1}: API Error"]
+        }
 
-STRATEGY:
-1. Use `re.finditer` or `re.search` to find the most relevant header or keywords.
-2. Since PDFs converted to Markdown can have messy headers (e.g., "# 1.2 Risk Management"), use flexible regex like `r'#+.*Risk.*Management.*'`.
-3. Capture a large block of text (e.g., 2000-4000 characters) following the match to ensure you don't cut off the content.
-4. If a specific section is not found, return the first 20 lines of the document so we can see the format.
+    data = response.json()
+    message = data["choices"][0]["message"]
+    tool_calls = message.get("tool_calls")
+    
+    new_messages = [message]
+    history_entry = f"Depth {current_depth+1}: Processing"
 
-RULES:
-- NO 'import' statements.
-- The modules re and json are already available. Do not use the import keyword.
-- Assign the final text to the variable `result`.
-- Return ONLY valid JSON: {{"python_code": "..."}}
-"""
+    # Tool execution
+    if tool_calls:
+        logger.info(f"Tool calls detected: {len(tool_calls)}")
+        for tool_call in tool_calls:
+            if tool_call["function"]["name"] == "recursive_document_search":
+                args = json.loads(tool_call["function"]["arguments"])
+                code_to_run = args.get("code", "")
+                
+                logger.info(f"Executing tool with code length: {len(code_to_run)}")
+                
+                tool_output = recursive_document_search.invoke({"code": code_to_run})
+                
+                logger.info(f"Tool output length: {len(str(tool_output))}")
+                
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "name": "recursive_document_search",
+                    "content": str(tool_output)
+                }
+                new_messages.append(tool_message)
+                history_entry = f"Depth {current_depth+1}: Tool executed (Output len: {len(str(tool_output))})"
 
-    msgs = [{"role": "system", "content": code_prompt}] + [serialize_message(m) for m in state["messages"]]
+    logger.info(f"Adding {len(new_messages)} new messages to state")
+    if new_messages:
+        last_new_msg = new_messages[-1]
+        logger.info(f"Last new message role: {last_new_msg.get('role', 'N/A')}")
 
-    async with httpx.AsyncClient(verify=False, timeout=TIMEOUT) as client:
-        try:
-            # 1. Generate Python snippet
-            res_code = await client.post(OPENROUTER_URL, headers=headers, json={
-                "model": MODEL, "messages": msgs, "temperature": 0.0
-            })
-            res_code.raise_for_status()
-            
-            raw_code_resp = res_code.json()["choices"][0]["message"]["content"]
-            json_match = re.search(r'\{.*\}', raw_code_resp, re.S).group()
-            code = json.loads(json_match)["python_code"]
-            
-            # 2. Run in Tool
-            tool_output = recursive_document_search.invoke({"code": code})
-            logger.info(f"Tool Output Sample: {str(tool_output)[:100]}...")
-            
-        except Exception as e:
-            tool_output = f"Critical extraction error: {str(e)}"
+    # Parse confidence
+    content = message.get("content", "") or ""
+    logger.info(f"Raw LLM content length: {len(content)}")
+    
+    confidence = 0.0
+    
+    try:
+        cleaned_content = re.sub(r'^```json\s*|\s*```$', '', content.strip(), flags=re.MULTILINE)
+        json_data = json.loads(cleaned_content)
+        confidence = float(json_data.get("confidence", 0.0))
+        logger.info(f"Parsed confidence from JSON: {confidence}")
+    except:
+        conf_match = re.search(r'"confidence"\s*:\s*(1(?:\.0+)?|0(?:\.\d+)?)', content)
+        if conf_match:
+            confidence = float(conf_match.group(1))
+            logger.info(f"Parsed confidence from regex: {confidence}")
+        else:
+            logger.warning(f"Could not parse confidence")
 
-        # 2️⃣ PHASE TWO: INTELLIGENT SYNTHESIS
-        synth_prompt = f"""
-        Original User Query: {user_query}
-        Data Extracted from Doc: {tool_output}
-        
-        Instruction: 
-        Analyze the data. If it looks like a list of headers or random text, state that you couldn't find the specific answer.
-        Otherwise, answer the query based ONLY on the extracted text.
-        Return JSON: {{"answer": "...", "confidence": 0.0-1.0}}
-        """
-        
-        res_synth = await client.post(OPENROUTER_URL, headers=headers, json={
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": "Return ONLY JSON with 'answer' and 'confidence'."},
-                {"role": "user", "content": synth_prompt}
-            ],
-            "temperature": 0.0
-        })
-        
-        try:
-            synth_json = re.search(r'\{.*\}', res_synth.json()["choices"][0]["message"]["content"], re.S).group()
-            final_data = json.loads(synth_json)
-            answer = final_data.get("answer", "Parsing error in synthesis.")
-            conf = float(final_data.get("confidence", 0.0))
-            final_message = f"{answer}\n\n---\n**Confidence Score:** {int(conf * 100)}%"
-        except:
-            answer = "The system failed to interpret the document results."
-            conf = 0.0
-
-    # 3️⃣ UPDATE STATE
-    # Note: Jan 27 Update - appending to search_history list.
     return {
-        "messages": [{"role": "assistant", "content": answer}],
+        "messages": state["messages"] + new_messages,
         "depth": current_depth + 1,
-        "confidence": conf,
-        "search_history": [f"Depth {current_depth+1}: Query '{user_query[:15]}', Output Len {len(str(tool_output))}, , Confidence: {conf:.2f}"]
+        "confidence": confidence,
+        "search_history": [history_entry]
     }
 
-# --- ROUTER ---
+def should_continue(state: RLMState):
+    logger.info(f"=== ROUTING === Depth: {state['depth']}, Confidence: {state['confidence']}")
+    logger.info(f"Total messages in state: {len(state['messages'])}")
+    
+    if state["depth"] >= MAX_RECURSION_DEPTH:
+        logger.info("Exiting: Max recursion depth reached")
+        return "exit"
+        
+    if state["confidence"] >= CONFIDENCE_THRESHOLD:
+        logger.info("Exiting: Confidence threshold met")
+        return "exit"
+    
+    # Check if we have messages
+    if not state["messages"]:
+        logger.warning("No messages in state!")
+        return "exit"
+    
+    last_msg = state["messages"][-1]
+    
+    # Debug: print the last message structure
+    logger.info(f"Last message type: {type(last_msg)}")
+    
+    # Handle both dict and object types
+    if isinstance(last_msg, dict):
+        last_role = last_msg.get("role", "unknown")
+    else:
+        last_role = getattr(last_msg, "role", getattr(last_msg, "type", "unknown"))
+    
+    logger.info(f"Last message role: {last_role}")
+    
+    # If it's a tool message, continue to let agent synthesize
+    if last_role == "tool":
+        logger.info("Continuing to agent: Tool result needs processing")
+        return "agent"
+    
+    logger.info("Exiting: Agent has provided final response")
+    return "exit"
 
-def route_decision(state: RLMState):
-    if state["confidence"] >= CONFIDENCE_THRESHOLD or state["depth"] >= MAX_RECURSION_DEPTH:
-        return "end"
-    return "continue"
-
-# --- GRAPH ---
-
+# --- 4. GRAPH CONSTRUCTION ---
 builder = StateGraph(RLMState)
+
 builder.add_node("agent", call_model)
+
 builder.add_edge(START, "agent")
-builder.add_conditional_edges("agent", route_decision, {"continue": "agent", "end": END})
+
+builder.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "agent": "agent",
+        "exit": END
+    }
+)
 
 graph = builder.compile()
