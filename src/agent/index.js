@@ -6,64 +6,98 @@ import path from "path";
 import pdf from "pdf-parse/lib/pdf-parse.js";
 import mammoth from "mammoth";
 
+// Update this to your data folder
 const ALLOWED_DIR = "/Users/balasuryhalavakumar/Documents/AI Projects/mcp/data";
 
 const server = new Server(
-  { name: "pro-filesystem", version: "1.1.0" },
+  { name: "pro-filesystem-mcp", version: "1.2.0" },
   { capabilities: { tools: {} } }
 );
 
-// --- Advanced Helper Functions ---
-
+/**
+ * Validates that the path is inside the allowed directory.
+ * Prevents AI from accessing your system files.
+ */
 async function validatePath(requestedPath) {
   const absolutePath = path.resolve(requestedPath);
-  if (!absolutePath.startsWith(path.resolve(ALLOWED_DIR))) {
-    throw new Error(`Access denied: ${requestedPath} is outside allowed directory`);
+  const rootPath = path.resolve(ALLOWED_DIR);
+  if (!absolutePath.startsWith(rootPath)) {
+    throw new Error(`Access denied: ${requestedPath} is outside the allowed sandbox.`);
   }
   return absolutePath;
 }
 
-// --- Tool Definitions ---
+/**
+ * Smart Reader: Checks if path is a directory and handles PDF/Docx conversion.
+ */
+async function readSmart(filePath) {
+  const stats = await fs.stat(filePath);
+  
+  if (stats.isDirectory()) {
+    throw new Error(`Error: "${path.basename(filePath)}" is a directory. Use list_files to see what's inside.`);
+  }
+
+  const ext = path.extname(filePath).toLowerCase();
+  const dataBuffer = await fs.readFile(filePath);
+
+  if (ext === ".pdf") {
+    const data = await pdf(dataBuffer);
+    return data.text;
+  } 
+  if (ext === ".docx") {
+    const result = await mammoth.extractRawText({ buffer: dataBuffer });
+    return result.value;
+  }
+  
+  return dataBuffer.toString("utf-8");
+}
+
+// --- Registering Tools ---
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
         name: "list_files",
-        description: "List files with sizes and modification dates",
+        description: "List files and folders with size and modification date.",
         inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
       },
       {
         name: "read_file",
-        description: "Smart read for txt, xml, pdf, docx",
+        description: "Read text from .txt, .xml, .md, .pdf, or .docx.",
         inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
       },
       {
-        name: "search_files",
-        description: "Search for a keyword inside all files in a directory",
-        inputSchema: { 
-          type: "object", 
-          properties: { 
-            query: { type: "string", description: "Keyword to find" },
-            directory: { type: "string", description: "Where to search" }
-          }, 
-          required: ["query", "directory"] 
-        }
-      },
-      {
         name: "write_file",
-        description: "Write text-based content to a file",
+        description: "Save text content to a file (.txt, .md, .xml, .json).",
         inputSchema: { 
           type: "object", 
           properties: { path: { type: "string" }, content: { type: "string" } }, 
           required: ["path", "content"] 
         }
+      },
+      {
+        name: "search_files",
+        description: "Search for specific text inside all files in a folder.",
+        inputSchema: { 
+          type: "object", 
+          properties: { 
+            query: { type: "string", description: "Keyword or phrase to find" },
+            directory: { type: "string", description: "Folder to search within" }
+          }, 
+          required: ["query", "directory"] 
+        }
+      },
+      {
+        name: "delete_file",
+        description: "Permanently delete a file.",
+        inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
       }
     ]
   };
 });
 
-// --- Execution Handler ---
+// --- Handling Tool Logic ---
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -73,52 +107,65 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "list_files": {
         const fullPath = await validatePath(args.path);
         const entries = await fs.readdir(fullPath, { withFileTypes: true });
-        const details = await Promise.all(entries.map(async (e) => {
-            const stats = await fs.stat(path.join(fullPath, e.name));
-            return `${e.name} (${stats.size} bytes, mod: ${stats.mtime.toISOString()})`;
+        const list = await Promise.all(entries.map(async (e) => {
+          const stats = await fs.stat(path.join(fullPath, e.name));
+          const type = e.isDirectory() ? "[FOLDER]" : "[FILE]";
+          return `${type} ${e.name} (${stats.size} bytes, modified: ${stats.mtime.toLocaleString()})`;
         }));
-        return { content: [{ type: "text", text: details.join("\n") }] };
+        return { content: [{ type: "text", text: list.join("\n") }] };
       }
 
       case "read_file": {
         const fullPath = await validatePath(args.path);
-        const ext = path.extname(fullPath).toLowerCase();
-        const dataBuffer = await fs.readFile(fullPath);
-        
-        let text;
-        if (ext === ".pdf") text = (await pdf(dataBuffer)).text;
-        else if (ext === ".docx") text = (await mammoth.extractRawText({ buffer: dataBuffer })).value;
-        else text = dataBuffer.toString("utf-8");
-
-        return { content: [{ type: "text", text }] };
-      }
-
-      case "search_files": {
-        const fullPath = await validatePath(args.directory);
-        const files = await fs.readdir(fullPath);
-        let results = [];
-        
-        for (const file of files) {
-          const content = await fs.readFile(path.join(fullPath, file), 'utf-8').catch(() => "");
-          if (content.includes(args.query)) results.push(file);
-        }
-        return { content: [{ type: "text", text: `Found "${args.query}" in: ${results.join(", ") || "None"}` }] };
+        const content = await readSmart(fullPath);
+        return { content: [{ type: "text", text: content }] };
       }
 
       case "write_file": {
         const fullPath = await validatePath(args.path);
         await fs.writeFile(fullPath, args.content, "utf-8");
-        return { content: [{ type: "text", text: `Saved to ${args.path}` }] };
+        return { content: [{ type: "text", text: `Successfully saved to ${args.path}` }] };
+      }
+
+      case "delete_file": {
+        const fullPath = await validatePath(args.path);
+        await fs.unlink(fullPath);
+        return { content: [{ type: "text", text: `Deleted ${args.path}` }] };
+      }
+
+      case "search_files": {
+        const dirPath = await validatePath(args.directory);
+        const files = await fs.readdir(dirPath);
+        let matches = [];
+
+        for (const file of files) {
+          try {
+            const filePath = path.join(dirPath, file);
+            const content = await readSmart(filePath); // Uses the smart reader to include PDFs
+            if (content.toLowerCase().includes(args.query.toLowerCase())) {
+              matches.push(file);
+            }
+          } catch (e) {
+            // Skip folders or unreadable files during search
+            continue;
+          }
+        }
+        return { 
+          content: [{ 
+            type: "text", 
+            text: matches.length > 0 ? `Found "${args.query}" in: ${matches.join(", ")}` : `No matches found for "${args.query}".` 
+          }] 
+        };
       }
 
       default:
         throw new Error("Tool not found");
     }
-  } catch (error) {
-    return { isError: true, content: [{ type: "text", text: error.message }] };
+  } catch (err) {
+    return { isError: true, content: [{ type: "text", text: err.message }] };
   }
 });
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("Pro MCP Server active.");
+console.error("Pro MCP Server is running...");
