@@ -1,23 +1,18 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { 
-  FileSystemServer, 
-  FullTextSearchIndex 
-} from "@modelcontextprotocol/server-filesystem";
+// 1. Import everything as 'mcpFs'
+import * as mcpFs from "@modelcontextprotocol/server-filesystem/dist/index.js";
 
-// 1. Define the directories you want to grant access to
-// Use absolute paths for best results
 const allowedDirectories = [
-  "/Users/yourname/Documents/project-folder",
-  "./data" 
+  "/Users/balasuryhalavakumar/Documents/AI_Projects/mcp/data"
 ];
 
-// 2. Initialize the Filesystem Server
-const fsServer = new FileSystemServer(allowedDirectories);
+// 2. Access the class from the namespace
+// In most versions, it's mcpFs.FileSystemServer
+const fsServer = new mcpFs.default.FileSystemServer(allowedDirectories);
 
-// 3. Connect it to the MCP Transport (usually Stdio)
 const server = new Server(
-  { name: "my-filesystem-server", version: "1.0.0" },
+  { name: "my-fs-server", version: "1.0.0" },
   { capabilities: fsServer.capabilities }
 );
 
