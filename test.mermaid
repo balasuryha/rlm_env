@@ -1,33 +1,44 @@
+%%{init: { 
+  "theme": "base", 
+  "themeVariables": { 
+    "primaryColor": "#ffffff",
+    "primaryTextColor": "#000000",
+    "primaryBorderColor": "#000000",
+    "lineColor": "#000000",
+    "secondaryColor": "#ffffff",
+    "tertiaryColor": "#ffffff",
+    "textColor": "#000000",
+    "mainBkg": "#ffffff",
+    "nodeBorder": "#000000",
+    "clusterBkg": "#ffffff",
+    "clusterBorder": "#000000",
+    "fontSize": "16px"
+  } 
+}%%
 sequenceDiagram
     autonumber
     participant U as User
-    participant M as Manager Agent<br/>(Orchestrator + Synthesizer)
-    participant DB as Vector DB<br/>(JSON Map)
-    participant W as Parallel Workers<br/>(Sub-LLMs)
-    participant MCP as MCP Server<br/>(File Access)
+    participant M as Manager Agent
+    participant DB as Vector DB (JSON Map)
+    participant W as Worker Agents
+    participant MCP as MCP Server
 
-    U->>M: Query: "Logic for OPE_001"
+    U->>M: Query: "Explain OPE_001 logic"
     
-    rect rgb(240, 240, 255)
-    Note over M, DB: PHASE 1: Discovery (Direct Lookup)
-    M->>DB: Metadata Filter: {code: "OPE_001"}
-    DB-->>M: Return: List of [Doc_Name, Heading]
-    end
+    Note over M, DB: 1. DISCOVERY
+    M->>DB: Lookup: {code: "OPE_001"}
+    DB-->>M: Hits: [Doc A, Doc B, Doc C]
 
-    rect rgb(230, 255, 230)
-    Note over M, MCP: PHASE 2: Parallel Extraction
-    M->>W: Fan-out: 5 Unique Extraction Tasks
-    par Worker to MCP
-        W->>MCP: read_pdf_section(Doc A, Heading X)
-        W->>MCP: read_pdf_section(Doc B, Heading Y)
-        W->>MCP: read_pdf_section(Doc C, Heading Z)
+    Note over M, MCP: 2. PARALLEL EXTRACTION
+    M->>W: Fan-out: 3 Specific Tasks
+    par Simultaneous Reads
+        W->>MCP: read_pdf(Doc A, Heading X)
+        W->>MCP: read_pdf(Doc B, Heading Y)
+        W->>MCP: read_pdf(Doc C, Heading Z)
     end
-    MCP-->>W: Return Segment Text
-    end
-
-    rect rgb(255, 245, 230)
-    Note over M, W: PHASE 3: Integrated Synthesis
-    W-->>M: Deliver 5 Mini-Reports
-    M->>M: Compare, Cross-Ref & Resolve Conflicts
-    M->>U: Final Unified Technical Response
-    end
+    MCP-->>W: Return Technical Text
+    
+    Note over M, W: 3. CONTEXTUAL SYNTHESIS
+    W-->>M: Deliver Section Analyses
+    M->>M: Review, Merge & Compare
+    M->>U: Final Answer (Unified Report)
