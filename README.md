@@ -1,1 +1,36 @@
 npx @modelcontextprotocol/inspector npx -y @modelcontextprotocol/server-filesystem "/Users/balasuryhalavakumar/Documents/AI Projects/mcp/data"
+
+
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant M as Manager Agent<br/>(Orchestrator + Synthesizer)
+    participant DB as Vector DB<br/>(JSON Map)
+    participant W as Parallel Workers<br/>(Sub-LLMs)
+    participant MCP as MCP Server<br/>(File Access)
+
+    U->>M: Query: "Logic for OPE_001"
+    
+    rect rgb(240, 240, 255)
+    Note over M, DB: PHASE 1: Discovery (Direct Lookup)
+    M->>DB: Metadata Filter: {code: "OPE_001"}
+    DB-->>M: Return: List of [Doc_Name, Heading]
+    end
+
+    rect rgb(230, 255, 230)
+    Note over M, MCP: PHASE 2: Parallel Extraction
+    M->>W: Fan-out: 5 Unique Extraction Tasks
+    par Worker to MCP
+        W->>MCP: read_pdf_section(Doc A, Heading X)
+        W->>MCP: read_pdf_section(Doc B, Heading Y)
+        W->>MCP: read_pdf_section(Doc C, Heading Z)
+    end
+    MCP-->>W: Return Segment Text
+    end
+
+    rect rgb(255, 245, 230)
+    Note over M, W: PHASE 3: Integrated Synthesis
+    W-->>M: Deliver 5 Mini-Reports
+    M->>M: Compare, Cross-Ref & Resolve Conflicts
+    M->>U: Final Unified Technical Response
+    end
