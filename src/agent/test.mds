@@ -1,0 +1,41 @@
+graph TD
+    %% Entry Point
+    User((User)) -->|Question via CLI| Orchestrator[LangGraph Orchestrator]
+
+    %% Step 1: Retrieval
+    subgraph "Phase 1: Discovery"
+        Orchestrator -->|Query: top 30 chunks| Chroma[(ChromaDB + Custom Embed API)]
+        Chroma -.->|SSL verify=False| EmbedAPI[Custom Embedding Endpoint]
+        Chroma -->|Return 30 Metadatas| Orchestrator
+    end
+
+    %% Step 2: Logic
+    subgraph "Phase 2: Logic"
+        Orchestrator -->|Deduplicate & Group| Grouper{Top 5 Unique Docs?}
+    end
+
+    %% Step 3: Parallel Fan-Out
+    subgraph "Phase 3: Parallel Swarm (Fan-Out)"
+        Grouper -->|Doc 1 + Pages| W1[Worker LLM 1]
+        Grouper -->|Doc 2 + Pages| W2[Worker LLM 2]
+        Grouper -->|Doc 3 + Pages| W3[Worker LLM 3]
+        
+        %% MCP Interaction
+        W1 & W2 & W3 <-->|read_pdf| MCP[Sylphx PDF MCP Server]
+        MCP <-->|CWD Access| LocalPDFs[(Local PDF Folder)]
+        
+        %% Custom API Interaction
+        W1 & W2 & W3 -.->|SSL verify=False| CustomLLM[Custom LLM Endpoint]
+    end
+
+    %% Step 4: Fan-In
+    subgraph "Phase 4: Synthesis (Fan-In)"
+        W1 & W2 & W3 -->|Individual Reports| Synthesizer[Master LLM Node]
+        Synthesizer -->|Final Cohesive Answer| User
+    end
+
+    %% Styling
+    style Orchestrator fill:#f9f,stroke:#333,stroke-width:2px
+    style User fill:#fff,stroke:#333
+    style MCP fill:#bbf,stroke:#333
+    style CustomLLM fill:#fb7,stroke:#333
